@@ -13,8 +13,10 @@ from werkzeug.exceptions import HTTPException
 from backend.errors import UserError
 from backend.extraction import MAX_FILE_BYTES, extract_isolated
 from backend.focus import FocusStore
+from backend.generation_stream import stream_generation
 from backend.generation import extractive, extractive_details, ollama, ollama_status, _local_base
 from backend.cloud import generate as cloud_generate
+from backend.llamacpp import discover as llama_discover, generate_details as llama_generate, local_base as llama_base
 
 ROOT = Path(__file__).resolve().parent
 
@@ -44,13 +46,16 @@ def create_app(config=None):
     app.request_class = MemoryRequest
     app.config.update(
         MAX_CONTENT_LENGTH=MAX_FILE_BYTES + 1024 * 1024,
-        MAX_FORM_MEMORY_SIZE=256 * 1024, MAX_FORM_PARTS=12,
+        MAX_FORM_MEMORY_SIZE=256 * 1024, MAX_FORM_PARTS=16,
         SESSION_COOKIE_NAME="aura_device", SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_SECURE=False,
         PERMANENT_SESSION_LIFETIME=timedelta(days=90),
         DATA_DIR=os.environ.get("AURA_DATA_DIR", str(ROOT / ".aura-data")),
         OLLAMA_URL=os.environ.get("AURA_OLLAMA_URL", "http://127.0.0.1:11434"),
         OLLAMA_MODEL=os.environ.get("AURA_OLLAMA_MODEL", "llama3.2:3b"),
+        LLAMA_URL=os.environ.get("AURA_LLAMA_URL", ""),
+        LLAMA_MODEL=os.environ.get("AURA_LLAMA_MODEL", ""),
+        LLAMA_API_KEY=os.environ.get("AURA_LLAMA_API_KEY", ""),
         OPENAI_API_KEY=os.environ.get("OPENAI_API_KEY", ""),
         CLOUD_MODEL=os.environ.get("AURA_CLOUD_MODEL", "gpt-4.1-mini"),
         EXTRACTOR=extract_isolated, FOCUS_CLOCK=time.time,
@@ -60,6 +65,8 @@ def create_app(config=None):
     if config:
         app.config.update(config)
     _local_base(app.config["OLLAMA_URL"])
+    if app.config["LLAMA_URL"]:
+        llama_base(app.config["LLAMA_URL"])
     data_dir = Path(app.config["DATA_DIR"])
     data_dir.mkdir(parents=True, exist_ok=True)
     data_dir.chmod(0o700)
@@ -183,13 +190,23 @@ def create_app(config=None):
             raise UserError("This origin is not authorized.", 403, "origin_blocked")
         device()
         session.setdefault("csrf", secrets.token_urlsafe(32))
-        return jsonify(csrf_token=session["csrf"], generators=["extractive", "cloud", "ollama"],
-                       max_file_mb=20, ollama_model=app.config["OLLAMA_MODEL"], timer_url="/pomodoro",
+        return jsonify(csrf_token=session["csrf"], generators=["extractive", "cloud", "ollama", "llamacpp"],
+                       max_file_mb=20, llamacpp={"base_url": app.config["LLAMA_URL"], "model": app.config["LLAMA_MODEL"]}, ollama_model=app.config["OLLAMA_MODEL"], timer_url="/pomodoro",
                        cloud={"configured": bool(app.config["OPENAI_API_KEY"].strip()), "provider": "OpenAI", "model": app.config["CLOUD_MODEL"]})
 
     @app.get("/api/models/status")
     def model_status():
         return jsonify(ollama_status(app.config["OLLAMA_URL"], app.config["OLLAMA_MODEL"]))
+
+    @app.get("/api/llamacpp/status")
+    def llama_status():
+        if not same_origin():
+            raise UserError("Open Aura locally to detect llama.cpp.", 403, "origin_blocked")
+        base = request.args.get('base_url', '').strip() or app.config['LLAMA_URL']
+        model = request.args.get('model', '').strip() or app.config['LLAMA_MODEL']
+        if len(base)>2000 or len(model)>1024:
+            raise UserError('Local model settings are too long.',400,'invalid_fields')
+        return jsonify(llama_discover(base, model, app.config['LLAMA_API_KEY']))
 
     @app.post("/api/generate")
     def generate():
@@ -210,7 +227,7 @@ def create_app(config=None):
         difficulty, engine = request.form.get("difficulty", "mixed"), request.form.get("engine", "extractive")
         style, focus = request.form.get("style", "mixed"), request.form.get("focus", "").strip()
         input_format = request.form.get('input_format', 'auto')
-        if difficulty not in ("mixed", "beginner", "intermediate", "advanced") or engine not in ("extractive", "cloud", "ollama") or style not in ("mixed", "qa", "cloze"):
+        if difficulty not in ("mixed", "beginner", "intermediate", "advanced") or engine not in ("extractive", "cloud", "ollama", "llamacpp") or style not in ("mixed", "qa", "cloze"):
             raise UserError("Choose a valid difficulty and generator.", 400, "invalid_options")
         if input_format not in ('auto','qa','topics','prose'):
             raise UserError('Choose a valid document format.',400,'invalid_options')
@@ -223,29 +240,54 @@ def create_app(config=None):
                 raise UserError("Confirm sending document text to OpenAI before using Cloud AI.", 400, "cloud_consent_required")
             if not app.config["OPENAI_API_KEY"].strip():
                 raise UserError("Set OPENAI_API_KEY on the server to use Cloud AI, or choose Offline.", 503, "cloud_not_configured")
+        depth, detail = request.form.get('generation_depth', 'thorough'), request.form.get('answer_detail', 'expanded')
+        if depth not in ('flash', 'balanced', 'thorough') or detail not in ('focused', 'expanded'):
+            raise UserError('Choose a valid generation depth and answer detail.', 400, 'invalid_options')
+        base = request.form.get('llama_base', '').strip() or app.config['LLAMA_URL']
+        model = request.form.get('llama_model', '').strip() or app.config['LLAMA_MODEL']
+        if len(base) > 2000 or len(model) > 1024:
+            raise UserError('Local model settings are too long.', 400, 'invalid_fields')
+        wants_stream = engine == 'llamacpp' and 'application/x-ndjson' in request.headers.get('Accept', '')
+        # Copy config before the worker; neither request nor session crosses threads.
+        generation_config = {k: app.config[k] for k in ('LLAMA_API_KEY', 'OLLAMA_URL', 'OLLAMA_MODEL', 'OPENAI_API_KEY', 'CLOUD_MODEL')}
         if not generation_lock.acquire(blocking=False):
             raise UserError("Another document is processing. Try again shortly.", 429, "server_busy")
         try:
             raw = file.stream.read(MAX_FILE_BYTES + 1)
             document = app.config["EXTRACTOR"](raw, file.filename)
+        except Exception:
+            generation_lock.release(); raise
+        finally:
+            file.close()
+        def run_generation(progress=None):
             warnings = list(document.warnings)
             details = {}
-            if engine == "ollama":
-                cards, extra = ollama(document, count, difficulty, app.config["OLLAMA_URL"], app.config["OLLAMA_MODEL"], style, focus)
+            if engine == "llamacpp":
+                if progress:
+                    progress({'phase': 'connecting', 'message': 'Connecting to your selected local model…', 'accepted': 0, 'requested': count})
+                status = llama_discover(base, model, generation_config['LLAMA_API_KEY'])
+                cards, extra, report = llama_generate(document, count, difficulty, status, generation_config['LLAMA_API_KEY'], style, focus, depth, detail, progress)
+                warnings.extend(extra)
+                details.update(local_model=status['model'], generation_report=report)
+            elif engine == "ollama":
+                cards, extra = ollama(document, count, difficulty, generation_config["OLLAMA_URL"], generation_config["OLLAMA_MODEL"], style, focus)
                 warnings.extend(extra)
             elif engine == "cloud":
-                cards, extra = cloud_generate(document, count, difficulty, app.config["OPENAI_API_KEY"], app.config["CLOUD_MODEL"], style, focus)
+                cards, extra = cloud_generate(document, count, difficulty, generation_config["OPENAI_API_KEY"], generation_config["CLOUD_MODEL"], style, focus)
                 warnings.extend(extra)
             else:
                 cards, extra, details = extractive_details(document, count, difficulty, style, focus, input_format)
                 warnings.extend(extra)
             if len(cards) < count:
-                warnings.append(f"Created {len(cards)} supported cards instead of {count}; the source contained fewer usable facts.")
-            return jsonify(cards=cards, engine=engine, requested_count=count, generated_count=len(cards), warnings=warnings,
-                           card_types=dict(Counter(c.get('kind', 'fact') for c in cards)), **details)
+                warnings.append(f"Created {len(cards)} supported cards instead of {count}; see generation notes for local model limits." if engine == "llamacpp" else f"Created {len(cards)} supported cards instead of {count}; the source contained fewer usable facts.")
+            return dict(cards=cards, engine=engine, requested_count=count, generated_count=len(cards), warnings=warnings,
+                        card_types=dict(Counter(c.get('kind', 'fact') for c in cards)), **details)
+        if wants_stream:
+            return stream_generation(run_generation, generation_lock.release)
+        try:
+            return jsonify(run_generation())
         finally:
             generation_lock.release()
-            file.close()
 
     @app.route("/api/focus-sessions", methods=["GET", "POST", "DELETE"])
     def focus_sessions():
@@ -271,6 +313,8 @@ def create_app(config=None):
             raise UserError("Send a valid JSON object.", 400, "invalid_json")
         return jsonify(store.control(sid, token, data.get("action"), origin))
 
+    from backend.integration import register
+    register(app, device, csrf, data_dir)
     return app
 
 
@@ -278,7 +322,8 @@ if __name__ == "__main__":
     from waitress import serve
     import argparse
     parser = argparse.ArgumentParser(description="Run Aura Cards locally")
-    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--port", type=int, default=os.environ.get("AURA_PORT", "5000"),
+                        help="Local listening port (or set AURA_PORT; default: 5000)")
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         parser.error("Choose a port between 1024 and 65535.")

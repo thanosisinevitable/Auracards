@@ -103,7 +103,7 @@ class ApiTests(unittest.TestCase):
         for kind,factory in [('pdf',pdf_bytes),('docx',docx_bytes),('pptx',pptx_bytes)]:
             response=self.upload(factory(),'notes.'+kind)
             self.assertEqual(response.status_code,200,response.json);self.assertEqual(len(response.json['cards']),10)
-        self.assertEqual(sorted(p.name for p in Path(self.tmp.name).iterdir()),['focus.sqlite3'])
+        self.assertEqual(sorted(p.name for p in Path(self.tmp.name).iterdir()),['focus.sqlite3','study-library.sqlite3'])
         with sqlite3.connect(Path(self.tmp.name)/'focus.sqlite3') as db:
             self.assertEqual(db.execute('SELECT count(*) FROM focus_sessions').fetchone()[0],0)
     def test_generation_validation_and_error_messages(self):

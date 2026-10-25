@@ -1,3 +1,5 @@
+> For the new two-project integration, use [LINKING.md](../LINKING.md). This page documents the retained legacy standalone /pomodoro timer.
+
 # Pomodoro integration
 
 Aura includes a working focus timer so both projects can be developed independently. Your friend's timer can replace that screen while keeping Aura's session tracking. Store its URL in **Settings → Connections → Timer URL**.
