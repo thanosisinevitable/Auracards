@@ -1,5 +1,6 @@
 """Aura Cards local Flask API and frontend server. Run python app.py."""
 from collections import defaultdict, deque, Counter
+import hmac
 from datetime import timedelta
 from io import BytesIO
 import os
@@ -60,6 +61,7 @@ def create_app(config=None):
         CLOUD_MODEL=os.environ.get("AURA_CLOUD_MODEL", "gpt-4.1-mini"),
         EXTRACTOR=extract_isolated, FOCUS_CLOCK=time.time,
         ALLOWED_ORIGINS=set(filter(None, os.environ.get("AURA_ALLOWED_ORIGINS", "").split(","))),
+        FRAME_ORIGINS=set(filter(None, os.environ.get("AURA_FRAME_ORIGINS", "").split(","))),
         TRUSTED_HOSTS=["localhost", "127.0.0.1", "[::1]"],
     )
     if config:
@@ -142,7 +144,29 @@ def create_app(config=None):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:* http://127.0.0.1:* https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+        policy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:* http://127.0.0.1:* https:; object-src 'none'; base-uri 'self'"
+        frames = app.config["FRAME_ORIGINS"]
+        # Only the workspace page is embeddable, and only when the user opts in.
+        # API endpoints and every other route remain unframeable.
+        if request.path in ("/", "/index.html") and frames:
+            def safe_frame(value):
+                try:
+                    parsed = urlsplit(value)
+                    return (parsed.scheme == 'http' and parsed.hostname in ('localhost', '127.0.0.1')
+                            and parsed.port is not None and parsed.path in ('', '/')
+                            and not any((parsed.username, parsed.password, parsed.query, parsed.fragment))
+                            and value.rstrip('/') == f'{parsed.scheme}://{parsed.netloc}')
+                except ValueError:
+                    return False
+            safe_frames = [value for value in sorted(frames) if safe_frame(value)]
+            if safe_frames:
+                response.headers.pop("X-Frame-Options", None)
+                policy += "; frame-ancestors " + " ".join(safe_frames)
+            else:
+                policy += "; frame-ancestors 'none'"
+        else:
+            policy += "; frame-ancestors 'none'"
+        response.headers["Content-Security-Policy"] = policy
         if request.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         origin = request.headers.get("Origin")
@@ -179,6 +203,21 @@ def create_app(config=None):
     @app.get("/pomodoro")
     def timer():
         return send_from_directory(app.static_folder, "pomodoro.html")
+
+    @app.get("/api/integrations/summary")
+    def legacy_pomodoro_summary():
+        # Legacy Study Space's progress widget only needs aggregate totals.
+        # Opt-in via a shared, long-lived token; no deck or study metadata.
+        token = os.environ.get("STUDY_INTEGRATION_TOKEN", "")
+        provided = request.headers.get("Authorization", "")
+        if len(token) < 32 or not hmac.compare_digest(provided, "Bearer " + token):
+            raise UserError("Legacy integration token missing or invalid.", 401, "not_authorized")
+        import sqlite3
+        with sqlite3.connect(str(data_dir / "focus.sqlite3")) as db:
+            n, seconds = db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(duration),0) FROM focus_sessions WHERE status='completed'"
+            ).fetchone()
+        return jsonify(service="auracards", completed_sessions=n, total_minutes=seconds // 60)
 
     @app.get("/api/health")
     def health():
@@ -322,8 +361,8 @@ if __name__ == "__main__":
     from waitress import serve
     import argparse
     parser = argparse.ArgumentParser(description="Run Aura Cards locally")
-    parser.add_argument("--port", type=int, default=os.environ.get("AURA_PORT", "5000"),
-                        help="Local listening port (or set AURA_PORT; default: 5000)")
+    parser.add_argument("--port", type=int, default=os.environ.get("AURA_PORT", "5001"),
+                        help="Local listening port (or set AURA_PORT; default: 5001)")
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         parser.error("Choose a port between 1024 and 65535.")

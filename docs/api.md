@@ -1,6 +1,6 @@
 # API reference
 
-Base URL: `http://localhost:5000`. Responses use JSON except frontend/static files and CORS preflight. Error responses have `{"error":"Human-readable message","code":"machine_code"}` with an appropriate non-2xx status. A client should show the error, retain the selected file and allow a deliberate retry.
+Base URL: `http://localhost:5001` (combined package default; can be changed with `--port`). Responses use JSON except frontend/static files and CORS preflight. Error responses have `{"error":"Human-readable message","code":"machine_code"}` with an appropriate non-2xx status. A client should show the error, retain the selected file and allow a deliberate retry.
 
 ## Browser initialization
 

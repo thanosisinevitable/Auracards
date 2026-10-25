@@ -1,3 +1,5 @@
+> **Combined 2026 bundle:** use the root `README_START_HERE.md` and `start_pair.py`. It starts AuraCards on **5001** and Pomodoro on **8000**. The older examples below describe a different standalone configuration.
+
 # Aura Cards + Pomodoro — start here
 
 These are two separate Python apps. Run both on the same PC. They communicate over local HTTP APIs:

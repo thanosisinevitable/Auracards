@@ -43,7 +43,7 @@ Open **http://localhost:5001** (AuraCards) FIRST to publish your decks, then **h
 
 ## Other ports / manual API addresses
 
-- Aura listens on `--port NUMBER` (or the `AURA_PORT` environment variable; CLI takes precedence). Its default is `5000`.
+- Aura listens on `--port NUMBER` (or the `AURA_PORT` environment variable; CLI takes precedence). Its default is `5001` in this bundle.
 - Pomodoro listens on `PORT=NUMBER` (default `8000`).
 - Pomodoro calls Aura through `AURA_URL=http://127.0.0.1:AURA_PORT`, which must be set in the **Pomodoro** terminal.
 - Aura calls Pomodoro through `POMODORO_URL=http://127.0.0.1:POMODORO_PORT`, which must be set in the **Aura** terminal if Pomodoro isn't on `8000`.
