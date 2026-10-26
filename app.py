@@ -1,4 +1,10 @@
-"""Aura Cards local Flask API and frontend server. Run python app.py."""
+"""Aura Cards Flask API and frontend server for local use or Render.
+
+Run: python app.py
+Render sets PORT and RENDER_EXTERNAL_HOSTNAME automatically.
+Optional: AURA_TRUSTED_HOSTS for custom hostnames (comma-separated, no URLs),
+AURA_SECRET_KEY for a stable session signing key, AURA_DATA_DIR for server data.
+"""
 from collections import defaultdict, deque, Counter
 import hmac
 from datetime import timedelta
@@ -20,6 +26,22 @@ from backend.cloud import generate as cloud_generate
 from backend.llamacpp import discover as llama_discover, generate_details as llama_generate, local_base as llama_base
 
 ROOT = Path(__file__).resolve().parent
+
+
+def render_deployment():
+    return (os.environ.get("RENDER", "").lower() == "true"
+            or bool(os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()))
+
+
+def deployment_hosts():
+    # Keep explicit host validation; never trust every onrender.com service.
+    hosts = ["localhost", "127.0.0.1", "[::1]"]
+    render_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    if render_host:
+        hosts.append(render_host)
+    hosts.extend(host.strip() for host in
+                 os.environ.get("AURA_TRUSTED_HOSTS", "").split(",") if host.strip())
+    return list(dict.fromkeys(hosts))
 
 
 class MemoryRequest(Request):
@@ -49,7 +71,9 @@ def create_app(config=None):
         MAX_CONTENT_LENGTH=MAX_FILE_BYTES + 1024 * 1024,
         MAX_FORM_MEMORY_SIZE=256 * 1024, MAX_FORM_PARTS=16,
         SESSION_COOKIE_NAME="aura_device", SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_SECURE=False,
+        SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_SECURE=render_deployment(),
+        RENDER_DEPLOYMENT=render_deployment(),
+        SECRET_KEY=os.environ.get("AURA_SECRET_KEY") or os.environ.get("SECRET_KEY") or None,
         PERMANENT_SESSION_LIFETIME=timedelta(days=90),
         DATA_DIR=os.environ.get("AURA_DATA_DIR", str(ROOT / ".aura-data")),
         OLLAMA_URL=os.environ.get("AURA_OLLAMA_URL", "http://127.0.0.1:11434"),
@@ -62,7 +86,7 @@ def create_app(config=None):
         EXTRACTOR=extract_isolated, FOCUS_CLOCK=time.time,
         ALLOWED_ORIGINS=set(filter(None, os.environ.get("AURA_ALLOWED_ORIGINS", "").split(","))),
         FRAME_ORIGINS=set(filter(None, os.environ.get("AURA_FRAME_ORIGINS", "").split(","))),
-        TRUSTED_HOSTS=["localhost", "127.0.0.1", "[::1]"],
+        TRUSTED_HOSTS=deployment_hosts(),
     )
     if config:
         app.config.update(config)
@@ -92,8 +116,15 @@ def create_app(config=None):
             session["device"] = secrets.token_urlsafe(24)
         return session["device"]
 
+    def browser_origin():
+        # Render serves public HTTPS through its proxy, even when the internal
+        # WSGI connection uses HTTP. Use the validated Host and deployment mode,
+        # not untrusted X-Forwarded-* headers, for these same-origin checks.
+        scheme = "https" if app.config["RENDER_DEPLOYMENT"] else request.scheme
+        return f"{scheme}://{request.host}"
+
     def same_origin():
-        return request.headers.get("Origin") in (None, request.host_url.rstrip("/"))
+        return request.headers.get("Origin") in (None, browser_origin())
 
     def csrf():
         origin = request.headers.get("Origin")
@@ -135,7 +166,7 @@ def create_app(config=None):
             response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             return response
-        if origin == request.host_url.rstrip("/") or origin in app.config["ALLOWED_ORIGINS"]:
+        if origin == browser_origin() or origin in app.config["ALLOWED_ORIGINS"]:
             return ("", 204)
         raise UserError("This origin is not authorized.", 403, "origin_blocked")
 
@@ -339,7 +370,7 @@ def create_app(config=None):
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
             raise UserError("Send a valid JSON object.", 400, "invalid_json")
-        timer_origin = origin_of(data.get("timer_url", request.host_url))
+        timer_origin = origin_of(data.get("timer_url", browser_origin()))
         return jsonify(store.create(device(), data.get("deck_id"), data.get("duration_minutes", 25), timer_origin)), 201
 
     @app.route("/api/focus-sessions/<sid>", methods=["GET", "POST"])
@@ -360,12 +391,23 @@ def create_app(config=None):
 if __name__ == "__main__":
     from waitress import serve
     import argparse
-    parser = argparse.ArgumentParser(description="Run Aura Cards locally")
-    parser.add_argument("--port", type=int, default=os.environ.get("AURA_PORT", "5001"),
-                        help="Local listening port (or set AURA_PORT; default: 5001)")
+    hosted = render_deployment()
+    parser = argparse.ArgumentParser(description="Run Aura Cards locally or on Render")
+    default_port = (os.environ.get("PORT", "10000") if hosted
+                    else os.environ.get("AURA_PORT", os.environ.get("PORT", "5001")))
+    parser.add_argument("--port", type=int, default=default_port,
+                        help="Listening port (Render: PORT; local default: 5001)")
+    parser.add_argument("--host", default="0.0.0.0" if hosted else "127.0.0.1",
+                        help="Listening address (Render: 0.0.0.0; local: 127.0.0.1)")
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         parser.error("Choose a port between 1024 and 65535.")
-    print(f"Aura Cards → http://localhost:{args.port}", flush=True)
-    print("Press Ctrl+C to stop. Offline generation is local; Cloud AI is opt-in.", flush=True)
-    serve(create_app(), host="127.0.0.1", port=args.port, threads=4, max_request_body_size=MAX_FILE_BYTES + 1024 * 1024, inbuf_overflow=MAX_FILE_BYTES + 2 * 1024 * 1024)
+    if hosted:
+        public_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+        print(f"Aura Cards on Render: {public_url or 'listening on port ' + str(args.port)}", flush=True)
+    else:
+        print(f"Aura Cards → http://localhost:{args.port}", flush=True)
+    print("Press Ctrl+C to stop. Cloud AI is opt-in.", flush=True)
+    serve(create_app(), host=args.host, port=args.port, threads=4,
+          max_request_body_size=MAX_FILE_BYTES + 1024 * 1024,
+          inbuf_overflow=MAX_FILE_BYTES + 2 * 1024 * 1024)
