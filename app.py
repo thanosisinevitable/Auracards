@@ -4,6 +4,7 @@ Run: python app.py
 Render sets PORT and RENDER_EXTERNAL_HOSTNAME automatically.
 Optional: AURA_TRUSTED_HOSTS for custom hostnames (comma-separated, no URLs),
 AURA_SECRET_KEY for a stable session signing key, AURA_DATA_DIR for server data.
+Set AURA_FRAME_ORIGINS to the exact Pomodoro HTTPS origin to allow its iframe.
 """
 from collections import defaultdict, deque, Counter
 import hmac
@@ -85,11 +86,20 @@ def create_app(config=None):
         CLOUD_MODEL=os.environ.get("AURA_CLOUD_MODEL", "gpt-4.1-mini"),
         EXTRACTOR=extract_isolated, FOCUS_CLOCK=time.time,
         ALLOWED_ORIGINS=set(filter(None, os.environ.get("AURA_ALLOWED_ORIGINS", "").split(","))),
-        FRAME_ORIGINS=set(filter(None, os.environ.get("AURA_FRAME_ORIGINS", "").split(","))),
+        FRAME_ORIGINS=set(filter(None, os.environ.get("AURA_FRAME_ORIGINS",
+            "https://pomodoro-website-python-project.onrender.com" if render_deployment() else "").split(","))),
         TRUSTED_HOSTS=deployment_hosts(),
     )
     if config:
         app.config.update(config)
+    # Explicit frame opt-in permits a hosted Pomodoro site to embed Aura.
+    # SameSite=None is needed for cross-site iframe requests over HTTPS.
+    # CSRF tokens and same-origin API checks remain required.
+    if app.config["RENDER_DEPLOYMENT"] and app.config["FRAME_ORIGINS"]:
+        app.config["SESSION_COOKIE_SAMESITE"] = "None"
+        app.config["SESSION_COOKIE_SECURE"] = True
+        # Isolate iframe sessions by top-level site in browsers supporting CHIPS.
+        app.config["SESSION_COOKIE_PARTITIONED"] = True
     _local_base(app.config["OLLAMA_URL"])
     if app.config["LLAMA_URL"]:
         llama_base(app.config["LLAMA_URL"])
@@ -183,9 +193,15 @@ def create_app(config=None):
             def safe_frame(value):
                 try:
                     parsed = urlsplit(value)
-                    return (parsed.scheme == 'http' and parsed.hostname in ('localhost', '127.0.0.1')
-                            and parsed.port is not None and parsed.path in ('', '/')
+                    port = parsed.port  # Validate malformed or out-of-range ports.
+                    local_http = (parsed.scheme == 'http'
+                                  and parsed.hostname in ('localhost', '127.0.0.1')
+                                  and port is not None)
+                    explicit_https = parsed.scheme == 'https' and bool(parsed.hostname)
+                    return ((local_http or explicit_https)
+                            and parsed.path in ('', '/')
                             and not any((parsed.username, parsed.password, parsed.query, parsed.fragment))
+                            and not any(c.isspace() for c in value)
                             and value.rstrip('/') == f'{parsed.scheme}://{parsed.netloc}')
                 except ValueError:
                     return False
