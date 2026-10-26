@@ -48,7 +48,7 @@
     }
 
     const request = async body => {
-        const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 5000);
+        const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 8000);
         try { return await api('/api/linked/timer', body ? {method:'POST', body, signal:controller.signal} : {signal:controller.signal}); }
         finally { clearTimeout(timeout); }
     };
@@ -68,7 +68,7 @@
         $l('linkedConnectionText').textContent = t.online ? (s?.running ? 'In session' : 'Ready') : 'Offline';
         $l('focusShortcutDot').classList.toggle('running', Boolean(t.online && s?.running));
         $l('linkedStatus').textContent = !t.online
-            ? 'Pomodoro is offline. Start the Pomodoro server, then this companion will reconnect automatically.'
+            ? 'Pomodoro is unavailable or waking up. Open the Pomodoro website and wait for it to load; this companion reconnects automatically.'
             : `Connected to Pomodoro · ${s.running ? 'Running' : 'Ready or paused'} · Round ${s.round} of 4`;
         $l('linkedToggle').textContent = s?.running ? (s.mode === 'focus' ? 'Pause focus' : 'Pause break') : (s?.mode === 'shortBreak' || s?.mode === 'longBreak' ? 'Start break' : 'Start focus');
         panel.querySelectorAll('[data-timer-action], [data-timer-mode], #linkedSave').forEach(b => b.disabled = !t.online || t.busy);
