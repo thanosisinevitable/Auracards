@@ -1,14 +1,15 @@
-"""Local flashcard sharing and proxy routes for Study Space."""
+"""Flashcard sharing and local/hosted Pomodoro proxy routes."""
 import json
 import sqlite3
+from contextlib import closing
 from flask import jsonify, request
 from .errors import UserError
-from .local_bridge import peer_call
+from .local_bridge import peer_call, hosted
 
 
 def register(app, device, csrf, data_dir):
     path = str(data_dir / "study-library.sqlite3")
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute("CREATE TABLE IF NOT EXISTS libraries(owner TEXT PRIMARY KEY, payload TEXT NOT NULL)")
 
     @app.route('/api/study-library', methods=['POST'])
@@ -35,16 +36,16 @@ def register(app, device, csrf, data_dir):
         payload = json.dumps(clean)
         if len(payload.encode()) > 10 * 1024 * 1024:
             raise UserError('Shared decks must be under 10 MB.', 413, 'library_too_large')
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute('INSERT INTO libraries(owner,payload) VALUES (?,?) ON CONFLICT(owner) DO UPDATE SET payload=excluded.payload', (device(), payload))
         return jsonify(success=True, decks=len(clean))
 
     @app.get('/api/integration/decks')
     def peer_decks():
-        # This endpoint is only for local server-to-server calls, never browser fetches.
+        # Shared-deck reads retain their existing local-only scope.
         if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('Origin') or request.headers.get('Sec-Fetch-Site'):
             raise UserError('Use the Pomodoro server to read shared decks.', 403, 'peer_only')
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             decks = [d for row in db.execute('SELECT payload FROM libraries ORDER BY owner') for d in json.loads(row[0])]
         return jsonify(decks=decks)
 
@@ -56,7 +57,10 @@ def register(app, device, csrf, data_dir):
         if request.method == 'POST' and not isinstance(payload, dict):
             raise UserError('Send a JSON object.', 400, 'invalid_json')
         try:
-            data, status = peer_call('POMODORO_URL', 'http://127.0.0.1:8000', '/api/timer', payload)
+            data, status = peer_call('POMODORO_URL',
+                                     'https://pomodoro-website-python-project.onrender.com'
+                                     if hosted() else 'http://127.0.0.1:8000',
+                                     '/api/timer', payload)
         except ValueError as error:
             raise UserError(str(error), 503, 'peer_config') from error
         return jsonify(data), status
