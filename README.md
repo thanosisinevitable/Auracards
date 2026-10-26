@@ -1,5 +1,7 @@
 # AuraCards
 
+https://auracards.onrender.com/
+
 Turn your notes into flashcards, organise them into decks, and study at your own pace.
 
 AuraCards runs on your computer. Upload **PDF, DOCX, or PPTX** files, generate cards, review the results, and start studying.
